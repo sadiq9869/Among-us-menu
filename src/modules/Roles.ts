@@ -1,19 +1,33 @@
-// ===== NEW FILE: add this file at src/modules/Roles.ts =====
 import { toast } from "frida-java-menu";
 
 import { AssemblyHelper } from "../core/AssemblyHelper";
 import { BaseModule } from "../core/BaseModule";
 import { State } from "../data/State";
-import { UnityUtils } from "../utils/UnityUtils";
 import { Logger } from "../logger/Logger";
+import { EnumUtils } from "../utils/EnumUtils";
+import { UnityUtils } from "../utils/UnityUtils";
 
-/** Roles that can be picked in the menu. `id` is the game's RoleTypes number. */
+/** Roles that can be picked in the menu. `id` is the game's RoleTypes number (checked against dump.cs, RoleTypes : ushort). */
 export const SELECTABLE_ROLES: { name: string; id: number }[] = [
     { name: "Impostor", id: 1 },
     { name: "Shapeshifter", id: 5 },
     { name: "Phantom", id: 9 },
     { name: "Viper", id: 18 }
 ];
+
+/**
+ * Impostor-team RoleTypes (Impostor, Shapeshifter, ImpostorGhost, Phantom, Viper), taken from the role names in dump.cs.
+ * Used only if RoleManager.IsImpostorRole can't be called.
+ */
+const IMPOSTOR_TEAM_FALLBACK = new Set<number>([1, 5, 7, 9, 18]);
+
+/** When to re-check that the roles stuck (ms after the swap) */
+const VERIFY_DELAYS_MS = [1000, 2500];
+
+interface RecordedRole {
+    player: Il2Cpp.Object; // PlayerControl
+    role: number | undefined; // RoleTypes, undefined if the argument could not be read
+}
 
 interface RolePlayer {
     player: Il2Cpp.Object; // PlayerControl
@@ -28,12 +42,13 @@ export class RolesModule extends BaseModule {
     private RoleManager!: Il2Cpp.Class;
 
     private RoleManager_SelectRoles!: Il2Cpp.Method;
+    private RoleManager_IsImpostorRole!: Il2Cpp.Method<boolean>;
     private PlayerControl_RpcSetRole!: Il2Cpp.Method;
 
     // While SelectRoles runs, we write down every role the game hands out.
     // The game applies roles a little later (coroutine), so reading them back right away is not reliable.
     private collecting = false;
-    private recorded: RolePlayer[] = [];
+    private recorded: RecordedRole[] = [];
 
     public init(): void {
         this.AmongUsClient = AssemblyHelper.AssemblyCSharp.class("AmongUsClient");
@@ -41,6 +56,7 @@ export class RolesModule extends BaseModule {
         this.RoleManager = AssemblyHelper.AssemblyCSharp.class("RoleManager");
 
         this.RoleManager_SelectRoles = this.RoleManager.method<void>("SelectRoles");
+        this.RoleManager_IsImpostorRole = this.RoleManager.method<boolean>("IsImpostorRole");
         this.PlayerControl_RpcSetRole = this.PlayerControl.method<void>("RpcSetRole", 2);
     }
 
@@ -49,20 +65,21 @@ export class RolesModule extends BaseModule {
 
         // Just listens: records (player, role) while SelectRoles is running, then passes the call through unchanged
         // @ts-ignore
-        this.PlayerControl_RpcSetRole.implementation = function (roleType: number, canOverrideRole: boolean): void {
+        this.PlayerControl_RpcSetRole.implementation = function (this: Il2Cpp.Object, roleType: unknown, canOverrideRole: boolean): void {
             if (module.collecting) {
                 try {
-                    module.recorded.push({ player: this as unknown as Il2Cpp.Object, role: Number(roleType) });
+                    module.recorded.push({ player: this, role: EnumUtils.toNumber(roleType) });
                 } catch (e) {
                     Logger.debug(`[${module.name}::RpcSetRole] Could not record: ${e}`);
                 }
             }
-            return this.method<void>("RpcSetRole", 2).invoke(roleType, canOverrideRole);
+            return this.method<void>("RpcSetRole", 2).invoke(roleType as any, canOverrideRole);
         };
 
         // The host runs SelectRoles once when the game starts.
         // We let the game hand out roles first, then do our swap.
-        this.RoleManager_SelectRoles.implementation = function (): void {
+        // @ts-ignore
+        this.RoleManager_SelectRoles.implementation = function (this: Il2Cpp.Object): void {
             const active = State.alwaysImpostor;
             module.recorded = [];
             module.collecting = active;
@@ -120,7 +137,8 @@ export class RolesModule extends BaseModule {
         const mine = everyone.find(p => p.player.handle.equals(me.handle));
         const myRole = mine ? mine.role : this.getRole(me);
         if (myRole === undefined) {
-            this.say("Always Impostor: could not read my role");
+            // Never send anything with an unknown role: this is exactly the NaN bug
+            this.say(`Always Impostor: could not read my role (source ${source}), skipped`);
             return;
         }
 
@@ -170,26 +188,40 @@ export class RolesModule extends BaseModule {
 
         this.say(`Role swap (${source}): me ${myRole}->${target} ${chosen.name}, partner ${partner ? partner.role + "->" + myRole : "none"}`);
 
-        // The game applies roles a moment later. Check, and try once more if it did not stick.
-        const partnerPlayer = partner ? partner.player : undefined;
-        const partnerNewRole = myRole;
-        setTimeout(() => {
-            UnityUtils.runInMain(() => this.verify(me, target, chosen.name, partnerPlayer, partnerNewRole)).catch(e =>
-                Logger.debug(`[${this.name}::verify] ${e}`)
-            );
-        }, 1500);
+        this.scheduleVerify(me, target, chosen.name, partner ? partner.player : undefined, myRole);
     }
 
-    /** Checks that the roles stuck. If not, sends them once more */
-    private verify(me: Il2Cpp.Object, target: number, targetName: string, partner: Il2Cpp.Object | undefined, partnerNewRole: number): void {
+    /** The game applies roles a moment later. Check a few times and send again if they did not stick. */
+    private scheduleVerify(me: Il2Cpp.Object, target: number, targetName: string, partner: Il2Cpp.Object | undefined, partnerNewRole: number): void {
+        VERIFY_DELAYS_MS.forEach((delay, index) => {
+            const isLast = index === VERIFY_DELAYS_MS.length - 1;
+            setTimeout(() => {
+                UnityUtils.runInMain(() => this.verify(me, target, targetName, partner, partnerNewRole, isLast)).catch(e =>
+                    Logger.debug(`[${this.name}::verify] ${e}`)
+                );
+            }, delay);
+        });
+    }
+
+    /** Checks that the roles stuck. If not, sends them again */
+    private verify(
+        me: Il2Cpp.Object,
+        target: number,
+        targetName: string,
+        partner: Il2Cpp.Object | undefined,
+        partnerNewRole: number,
+        isLast: boolean
+    ): void {
         try {
             if (me.isNull() || UnityUtils.cachedPtr(me).isNull()) return;
 
             const myNow = this.getRole(me);
-            if (myNow !== undefined && myNow !== target) {
+            if (myNow === undefined) {
+                this.say("Role check: could not read my role");
+            } else if (myNow !== target) {
                 me.method<void>("RpcSetRole", 2).invoke(target, true);
                 this.say(`Role check: I was ${myNow}, sent ${targetName} again`);
-            } else {
+            } else if (isLast) {
                 this.say(`Role check OK: I am ${myNow} (${targetName})`);
             }
 
@@ -211,7 +243,14 @@ export class RolesModule extends BaseModule {
             try {
                 if (entry.player.isNull()) continue;
                 if (UnityUtils.cachedPtr(entry.player).isNull()) continue;
-                byHandle.set(entry.player.handle.toString(), entry);
+
+                const role = entry.role ?? this.getRole(entry.player);
+                if (role === undefined) {
+                    Logger.debug(`[${this.name}::fromRecorded] Skipping a player: role unreadable`);
+                    continue;
+                }
+
+                byHandle.set(entry.player.handle.toString(), { player: entry.player, role });
             } catch (e) {
                 Logger.debug(`[${this.name}::fromRecorded] Skipping a player: ${e}`);
             }
@@ -239,7 +278,10 @@ export class RolesModule extends BaseModule {
                 if (data.isNull()) continue;
                 if (data.field<boolean>("Disconnected").value) continue;
 
-                result.push({ player, role: Number(data.field<number>("RoleType").value) });
+                const role = this.getRole(player);
+                if (role === undefined) continue;
+
+                result.push({ player, role });
             } catch (e) {
                 Logger.debug(`[${this.name}::fromPlayerData] Skipping a player: ${e}`);
             }
@@ -248,12 +290,17 @@ export class RolesModule extends BaseModule {
         return result;
     }
 
-    /** Current RoleTypes number of a player, or undefined if not ready yet */
+    /**
+     * Current RoleTypes number of a player, or undefined if not ready yet.
+     *
+     * NetworkedPlayerInfo.RoleType is a ushort enum, so it is read straight from memory.
+     * Going through the bridge's `.value` gave an object, which became NaN.
+     */
     private getRole(player: Il2Cpp.Object): number | undefined {
         try {
             const data = player.method<Il2Cpp.Object>("get_Data").invoke();
             if (data.isNull()) return undefined;
-            return Number(data.field<number>("RoleType").value);
+            return EnumUtils.readU16Field(data, "RoleType");
         } catch (e) {
             Logger.debug(`[${this.name}::getRole] ${e}`);
             return undefined;
@@ -262,7 +309,13 @@ export class RolesModule extends BaseModule {
 
     /** `static RoleManager::IsImpostorRole`. Works for any impostor-type role the game has */
     private isImpostorRole(role: number): boolean {
-        return this.RoleManager.method<boolean>("IsImpostorRole").invoke(role);
+        try {
+            const result = this.RoleManager_IsImpostorRole.invoke(role);
+            if (typeof result === "boolean") return result;
+        } catch (e) {
+            Logger.debug(`[${this.name}::isImpostorRole] ${e}`);
+        }
+        return IMPOSTOR_TEAM_FALLBACK.has(role);
     }
 
     private imp(role: number): number {
