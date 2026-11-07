@@ -1,3 +1,4 @@
+// ===== NEW FILE: add this file at src/modules/Roles.ts =====
 import { AssemblyHelper } from "../core/AssemblyHelper";
 import { BaseModule } from "../core/BaseModule";
 import { State } from "../data/State";
