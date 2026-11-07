@@ -1,4 +1,6 @@
 // ===== NEW FILE: add this file at src/modules/Roles.ts =====
+import { toast } from "frida-java-menu";
+
 import { AssemblyHelper } from "../core/AssemblyHelper";
 import { BaseModule } from "../core/BaseModule";
 import { State } from "../data/State";
@@ -26,6 +28,12 @@ export class RolesModule extends BaseModule {
     private RoleManager!: Il2Cpp.Class;
 
     private RoleManager_SelectRoles!: Il2Cpp.Method;
+    private PlayerControl_RpcSetRole!: Il2Cpp.Method;
+
+    // While SelectRoles runs, we write down every role the game hands out.
+    // The game applies roles a little later (coroutine), so reading them back right away is not reliable.
+    private collecting = false;
+    private recorded: RolePlayer[] = [];
 
     public init(): void {
         this.AmongUsClient = AssemblyHelper.AssemblyCSharp.class("AmongUsClient");
@@ -33,22 +41,45 @@ export class RolesModule extends BaseModule {
         this.RoleManager = AssemblyHelper.AssemblyCSharp.class("RoleManager");
 
         this.RoleManager_SelectRoles = this.RoleManager.method<void>("SelectRoles");
+        this.PlayerControl_RpcSetRole = this.PlayerControl.method<void>("RpcSetRole", 2);
     }
 
     public override initHooks(): void {
         const module = this;
 
-        // The host runs SelectRoles once when the game starts.
-        // We let the game give everyone their roles first, then do our swap.
-        this.RoleManager_SelectRoles.implementation = function (): void {
-            this.method<void>("SelectRoles").invoke();
+        // Just listens: records (player, role) while SelectRoles is running, then passes the call through unchanged
+        // @ts-ignore
+        this.PlayerControl_RpcSetRole.implementation = function (roleType: number, canOverrideRole: boolean): void {
+            if (module.collecting) {
+                try {
+                    module.recorded.push({ player: this as unknown as Il2Cpp.Object, role: Number(roleType) });
+                } catch (e) {
+                    Logger.debug(`[${module.name}::RpcSetRole] Could not record: ${e}`);
+                }
+            }
+            return this.method<void>("RpcSetRole", 2).invoke(roleType, canOverrideRole);
+        };
 
-            if (!State.alwaysImpostor) return;
+        // The host runs SelectRoles once when the game starts.
+        // We let the game hand out roles first, then do our swap.
+        this.RoleManager_SelectRoles.implementation = function (): void {
+            const active = State.alwaysImpostor;
+            module.recorded = [];
+            module.collecting = active;
+
+            try {
+                this.method<void>("SelectRoles").invoke();
+            } finally {
+                module.collecting = false;
+            }
+
+            if (!active) return;
 
             try {
                 module.applySelectedRole();
             } catch (error: any) {
                 Logger.error(`[${module.name}::SelectRoles] Role swap failed, game continues normally: ${error}`);
+                module.say(`Role swap error: ${error?.message ?? error}`);
             }
         };
     }
@@ -61,38 +92,47 @@ export class RolesModule extends BaseModule {
      */
     public applySelectedRole(): void {
         if (!this.amHost()) {
-            Logger.warn(`[${this.name}::applySelectedRole] Not the host, skipping`);
+            this.say("Always Impostor: you are not the host, skipped");
             return;
         }
 
-        const target = SELECTABLE_ROLES[State.selectedRoleIndex]?.id;
-        if (target === undefined) {
-            Logger.warn(`[${this.name}::applySelectedRole] No role selected`);
+        const chosen = SELECTABLE_ROLES[State.selectedRoleIndex];
+        if (chosen === undefined) {
+            this.say("Always Impostor: no role selected");
             return;
         }
+        const target = chosen.id;
 
         const me = this.localPlayer;
         if (me.isNull()) {
-            Logger.warn(`[${this.name}::applySelectedRole] LocalPlayer is null`);
+            this.say("Always Impostor: LocalPlayer is null");
             return;
         }
 
-        const myRole = this.getRole(me);
+        // Best source: what the game just handed out. Fallback: read from player data.
+        let source = "rpc";
+        let everyone = this.fromRecorded();
+        if (everyone.length === 0) {
+            source = "data";
+            everyone = this.fromPlayerData();
+        }
+
+        const mine = everyone.find(p => p.player.handle.equals(me.handle));
+        const myRole = mine ? mine.role : this.getRole(me);
         if (myRole === undefined) {
-            Logger.warn(`[${this.name}::applySelectedRole] Could not read my role`);
+            this.say("Always Impostor: could not read my role");
             return;
         }
+
+        const others = everyone.filter(p => !p.player.handle.equals(me.handle));
+        const total = others.length + 1;
+        const impostorsBefore = others.filter(p => this.isImpostorRole(p.role)).length + this.imp(myRole);
 
         // Already have it: nothing to do
         if (myRole === target) {
-            Logger.debug(`[${this.name}::applySelectedRole] Already role ${target}`);
+            this.say(`Always Impostor: already ${chosen.name}`);
             return;
         }
-
-        const others = this.collectOthers(me);
-        const total = others.length + 1;
-
-        const impostorsBefore = others.filter(p => this.isImpostorRole(p.role)).length + (this.isImpostorRole(myRole) ? 1 : 0);
 
         // 1) Someone already has the role we want? Swap with them.
         let partner = others.find(p => p.role === target);
@@ -114,28 +154,73 @@ export class RolesModule extends BaseModule {
         }
 
         if (impostorsAfter > impostorsBefore && impostorsBefore > 0) {
-            Logger.warn(`[${this.name}::applySelectedRole] Would raise impostors ${impostorsBefore} -> ${impostorsAfter}, skipping`);
+            this.say(`Always Impostor: would raise impostors ${impostorsBefore}->${impostorsAfter}, skipped`);
             return;
         }
         if (impostorsAfter > impostorsBefore && impostorsAfter >= total - impostorsAfter) {
-            Logger.warn(`[${this.name}::applySelectedRole] Impostors would equal/outnumber crew, skipping`);
+            this.say("Always Impostor: impostors would equal crew, skipped");
             return;
         }
 
         // Order matters: first the other player gets our old role, then we take the new one.
-        // This way the impostor count never goes above the original value.
         if (partner) {
-            Logger.debug(`[${this.name}::applySelectedRole] Swapping: partner ${partner.role} -> ${myRole}, me ${myRole} -> ${target}`);
             partner.player.method<void>("RpcSetRole", 2).invoke(myRole, true);
-        } else {
-            Logger.debug(`[${this.name}::applySelectedRole] No swap partner, me ${myRole} -> ${target}`);
         }
-
         me.method<void>("RpcSetRole", 2).invoke(target, true);
+
+        this.say(`Role swap (${source}): me ${myRole}->${target} ${chosen.name}, partner ${partner ? partner.role + "->" + myRole : "none"}`);
+
+        // The game applies roles a moment later. Check, and try once more if it did not stick.
+        const partnerPlayer = partner ? partner.player : undefined;
+        const partnerNewRole = myRole;
+        setTimeout(() => {
+            UnityUtils.runInMain(() => this.verify(me, target, chosen.name, partnerPlayer, partnerNewRole)).catch(e =>
+                Logger.debug(`[${this.name}::verify] ${e}`)
+            );
+        }, 1500);
     }
 
-    /** All valid, alive, connected players except `me` with their current role */
-    private collectOthers(me: Il2Cpp.Object): RolePlayer[] {
+    /** Checks that the roles stuck. If not, sends them once more */
+    private verify(me: Il2Cpp.Object, target: number, targetName: string, partner: Il2Cpp.Object | undefined, partnerNewRole: number): void {
+        try {
+            if (me.isNull() || UnityUtils.cachedPtr(me).isNull()) return;
+
+            const myNow = this.getRole(me);
+            if (myNow !== undefined && myNow !== target) {
+                me.method<void>("RpcSetRole", 2).invoke(target, true);
+                this.say(`Role check: I was ${myNow}, sent ${targetName} again`);
+            } else {
+                this.say(`Role check OK: I am ${myNow} (${targetName})`);
+            }
+
+            if (partner && !partner.isNull() && !UnityUtils.cachedPtr(partner).isNull()) {
+                const partnerNow = this.getRole(partner);
+                if (partnerNow !== undefined && partnerNow !== partnerNewRole) {
+                    partner.method<void>("RpcSetRole", 2).invoke(partnerNewRole, true);
+                }
+            }
+        } catch (e) {
+            Logger.debug(`[${this.name}::verify] ${e}`);
+        }
+    }
+
+    /** Roles the game handed out during SelectRoles (last one wins per player) */
+    private fromRecorded(): RolePlayer[] {
+        const byHandle = new Map<string, RolePlayer>();
+        for (const entry of this.recorded) {
+            try {
+                if (entry.player.isNull()) continue;
+                if (UnityUtils.cachedPtr(entry.player).isNull()) continue;
+                byHandle.set(entry.player.handle.toString(), entry);
+            } catch (e) {
+                Logger.debug(`[${this.name}::fromRecorded] Skipping a player: ${e}`);
+            }
+        }
+        return Array.from(byHandle.values());
+    }
+
+    /** Fallback: read roles from player data (may be out of date right after SelectRoles) */
+    private fromPlayerData(): RolePlayer[] {
         const result: RolePlayer[] = [];
 
         // static List<PlayerControl> PlayerControl::AllPlayerControls
@@ -146,7 +231,6 @@ export class RolesModule extends BaseModule {
         for (let i = 0; i < count; i++) {
             const player = list.method<Il2Cpp.Object>("get_Item").invoke(i);
             if (player.isNull()) continue;
-            if (player.handle.equals(me.handle)) continue;
 
             try {
                 if (UnityUtils.cachedPtr(player).isNull()) continue;
@@ -154,11 +238,10 @@ export class RolesModule extends BaseModule {
                 const data = player.method<Il2Cpp.Object>("get_Data").invoke();
                 if (data.isNull()) continue;
                 if (data.field<boolean>("Disconnected").value) continue;
-                if (data.field<boolean>("IsDead").value) continue;
 
                 result.push({ player, role: Number(data.field<number>("RoleType").value) });
             } catch (e) {
-                Logger.debug(`[${this.name}::collectOthers] Skipping a player: ${e}`);
+                Logger.debug(`[${this.name}::fromPlayerData] Skipping a player: ${e}`);
             }
         }
 
@@ -191,6 +274,16 @@ export class RolesModule extends BaseModule {
         const client = this.AmongUsClient.field<Il2Cpp.Object>("Instance").value;
         if (client.isNull()) return false;
         return client.method<boolean>("get_AmHost").invoke();
+    }
+
+    /** Log + on-screen message, so you can see what happened without a computer */
+    private say(message: string): void {
+        Logger.info(`[${this.name}] ${message}`);
+        try {
+            toast(message, 1);
+        } catch (e) {
+            Logger.debug(`[${this.name}::say] toast failed: ${e}`);
+        }
     }
 
     /** `static PlayerControl::LocalPlayer` */
