@@ -7,6 +7,13 @@ export const State = {
     unlockVents: false,
     walkInVents: false,
 
+    // Roles (host only)
+    alwaysImpostor: false,
+    selectedRoleIndex: 0, // index in SELECTABLE_ROLES (src/modules/Roles.ts)
+
+    // Chat
+    freeChat: false,
+
     unlockCosmetics: false,
     disableAnalytics: false,
     uwuifyMode: false,
